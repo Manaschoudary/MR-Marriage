@@ -1,13 +1,16 @@
 import { useState, useEffect } from 'react';
 import { Link, useLocation } from 'react-router-dom';
+import { getInvitationConfig, getInvitationModeFromPath } from '../utils/events';
+import { trackEvent } from '../utils/analytics';
 
 export default function Navbar() {
   const location = useLocation();
   const [scrolled, setScrolled] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const invitation = getInvitationConfig(getInvitationModeFromPath(location.pathname));
 
   useEffect(() => {
-    const onScroll = () => setScrolled(window.scrollY > 40);
+    const onScroll = () => setScrolled(window.scrollY > 12);
     window.addEventListener('scroll', onScroll, { passive: true });
     // Set initial state in case page loads mid-scroll
     onScroll();
@@ -17,55 +20,61 @@ export default function Navbar() {
   // Close menu on route change
   useEffect(() => { setMenuOpen(false); }, [location]);
 
-  const isHome = location.pathname === '/';
-  // Hide navbar content when at the very top of the home page
-  const ghost = isHome && !scrolled;
-
   const links = [
-    { to: '/',         label: 'Home'     },
-    { to: '/schedule', label: 'Schedule' },
-    { to: '/rsvp',     label: 'RSVP'     },
+    { to: invitation.homePath, label: 'Home' },
+    { to: invitation.rsvpPath, label: 'RSVP' },
   ];
+  const trackNavigation = (label, to) => {
+    trackEvent('action', {
+      actionName: 'navigation_click',
+      actionLabel: `Navigation: ${label}`,
+      metadata: {
+        invitationMode: invitation.mode,
+        invitationLabel: invitation.label,
+        destination: to,
+      },
+    }, { beacon: true });
+  };
 
+  const handleNavigationClick = (event, label, to) => {
+    trackNavigation(label, to);
+    if (to === invitation.homePath && location.pathname === invitation.homePath) {
+      event.preventDefault();
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      setMenuOpen(false);
+    }
+  };
   const isActive = (to) => {
-    if (to === '/') return location.pathname === '/';
+    if (to === invitation.homePath) return location.pathname === invitation.homePath;
     return location.pathname.startsWith(to);
   };
 
   return (
     <header
-      className={`fixed top-0 left-0 right-0 z-50 transition-all duration-500 ${
-        ghost
-          ? 'bg-transparent shadow-none'
-          : scrolled
-            ? 'bg-white/95 backdrop-blur-sm shadow-sm'
-            : 'bg-white/80'
+      className={`site-header fixed top-0 left-0 right-0 z-50 transition-all duration-500 ${
+        scrolled ? 'is-scrolled pt-2' : 'pt-4'
       }`}
     >
-      <div className="max-w-5xl mx-auto px-4 sm:px-6">
-        <div className="flex items-center justify-between h-16 md:h-20">
+      <div className="max-w-6xl mx-auto px-3 sm:px-6">
+        <div className="nav-shell">
 
           {/* Couple name – links to home */}
           <Link
-            to="/"
-            className={`font-serif text-lg md:text-xl tracking-widest2 text-mauve-800 hover:text-mauve-600 transition-all duration-500 uppercase ${
-              ghost ? 'opacity-0 pointer-events-none' : 'opacity-100'
-            }`}
+            to={invitation.homePath}
+            className="nav-brand"
+            onClick={(event) => handleNavigationClick(event, 'Brand', invitation.homePath)}
           >
-            Manas &amp; Rupa Sri
+            Manas &amp; Rupa Sree
           </Link>
 
           {/* Desktop nav */}
-          <nav className={`hidden md:flex items-center gap-8 transition-all duration-500 ${
-            ghost ? 'opacity-0 pointer-events-none' : 'opacity-100'
-          }`}>
+          <nav className="hidden md:flex items-center gap-2">
             {links.map(({ to, label }) => (
               <Link
                 key={to}
                 to={to}
-                className={`font-sans text-sm tracking-wider text-mauve-700 hover:text-mauve-900 transition-colors pb-1 ${
-                  isActive(to) ? 'border-b-2 border-mauve-700 font-medium' : 'border-b-2 border-transparent'
-                }`}
+                className={`nav-link ${isActive(to) ? 'is-active' : ''}`}
+                onClick={(event) => handleNavigationClick(event, label, to)}
               >
                 {label}
               </Link>
@@ -74,40 +83,49 @@ export default function Navbar() {
 
           {/* Mobile hamburger */}
           <button
-            className={`md:hidden flex flex-col gap-1.5 p-2 -mr-2 text-mauve-700 transition-all duration-500 ${
-              ghost ? 'opacity-0 pointer-events-none' : 'opacity-100'
-            }`}
-            onClick={() => setMenuOpen(!menuOpen)}
-            aria-label="Toggle menu"
+            type="button"
+            className="nav-menu-button md:hidden"
+            onClick={() => {
+              trackEvent('action', {
+                actionName: 'mobile_menu_toggle',
+                actionLabel: menuOpen ? 'Closed mobile menu' : 'Opened mobile menu',
+                metadata: {
+                  invitationMode: invitation.mode,
+                  invitationLabel: invitation.label,
+                },
+              }, { beacon: true });
+              setMenuOpen(!menuOpen);
+            }}
+            aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+            aria-expanded={menuOpen}
+            aria-controls="mobile-navigation"
           >
             <span className={`block w-6 h-0.5 bg-current transition-all duration-200 ${menuOpen ? 'rotate-45 translate-y-2' : ''}`} />
             <span className={`block w-6 h-0.5 bg-current transition-all duration-200 ${menuOpen ? 'opacity-0' : ''}`} />
             <span className={`block w-6 h-0.5 bg-current transition-all duration-200 ${menuOpen ? '-rotate-45 -translate-y-2' : ''}`} />
           </button>
         </div>
-      </div>
 
-      {/* Mobile dropdown menu */}
-      <div
-        className={`md:hidden overflow-hidden transition-all duration-300 ${
-          menuOpen ? 'max-h-48 border-t border-mauve-100' : 'max-h-0'
-        } bg-white/98 backdrop-blur-sm`}
-      >
-        <nav className="flex flex-col py-2 px-6">
-          {links.map(({ to, label }) => (
-            <Link
-              key={to}
-              to={to}
-              className={`font-sans text-sm tracking-wider py-3 border-b border-mauve-50 last:border-0 ${
-                isActive(to)
-                  ? 'text-mauve-800 font-medium'
-                  : 'text-mauve-600 hover:text-mauve-800'
-              } transition-colors`}
-            >
-              {label}
-            </Link>
-          ))}
-        </nav>
+        {/* Mobile dropdown menu */}
+        <div
+          id="mobile-navigation"
+          className={`nav-mobile-panel md:hidden ${menuOpen ? 'is-open' : ''}`}
+          aria-hidden={!menuOpen}
+        >
+          <nav className="nav-mobile-menu" aria-label="Mobile navigation">
+            {links.map(({ to, label }) => (
+              <Link
+                key={to}
+                to={to}
+                className={`nav-mobile-link ${isActive(to) ? 'is-active' : ''}`}
+                tabIndex={menuOpen ? 0 : -1}
+                onClick={(event) => handleNavigationClick(event, label, to)}
+              >
+                {label}
+              </Link>
+            ))}
+          </nav>
+        </div>
       </div>
     </header>
   );

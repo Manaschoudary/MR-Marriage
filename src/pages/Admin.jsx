@@ -5,6 +5,7 @@ import {
   ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Trash2, Mail, Phone, MessageSquare,
   Pencil, Save, XCircle, Plus, Minus, MapPin, Smartphone, Eye
 } from 'lucide-react';
+import { FULL_EVENT_DETAILS, WEDDING_EVENT_ID, getAttendanceText, normalizeEventAttendance } from '../utils/events';
 
 const VISITOR_PAGE_SIZE = 50;
 const AUTHED_REQUEST = { withCredentials: true };
@@ -45,12 +46,79 @@ function formatActionName(action) {
   return (action.eventType || 'action').replace(/_/g, ' ');
 }
 
+function formatInvitationMode(mode) {
+  if (mode === 'full') return 'Full invite';
+  if (mode === 'wedding-only') return 'Wedding only';
+  return 'Legacy RSVP';
+}
+
+function getLocalRsvps() {
+  try {
+    const stored = JSON.parse(localStorage.getItem('rsvps') || '[]');
+    return Array.isArray(stored)
+      ? stored.map((rsvp, index) => ({
+          ...rsvp,
+          id: rsvp.id || `local_${rsvp.submittedAt || index}`,
+          localOnly: true,
+        }))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function getRsvpMergeKey(rsvp) {
+  if (rsvp._id) return `server:${rsvp._id}`;
+
+  const guest = rsvp.primaryGuest || {};
+  return [
+    guest.firstName || '',
+    guest.lastName || '',
+    rsvp.submittedAt || '',
+    rsvp.invitationMode || '',
+  ].join('|').toLowerCase();
+}
+
+function mergeServerAndLocalRsvps(serverRsvps, localRsvps) {
+  const serverKeys = new Set(serverRsvps.map(getRsvpMergeKey));
+  const localOnly = localRsvps.filter(rsvp => !serverKeys.has(getRsvpMergeKey(rsvp)));
+  return [...localOnly, ...serverRsvps];
+}
+
+function stripLocalOnlyFlag(rsvp) {
+  const cleanRsvp = { ...rsvp };
+  delete cleanRsvp.localOnly;
+  return cleanRsvp;
+}
+
+function getWeddingAttendance(rsvp) {
+  const weddingEvent = normalizeEventAttendance(rsvp).find(event => event.id === WEDDING_EVENT_ID);
+  return weddingEvent?.attending || rsvp.primaryGuest?.attending || '';
+}
+
+function getEventGuestCount(rsvp, eventId) {
+  const event = normalizeEventAttendance(rsvp).find(item => item.id === eventId);
+  return Number(event?.guestCount) || 0;
+}
+
+function getEventGuestNames(rsvp, event) {
+  const primaryGuestName = event.primaryGuest?.name ||
+    `${rsvp.primaryGuest?.firstName || ''} ${rsvp.primaryGuest?.lastName || ''}`.trim();
+  const primary = event.attending === 'yes' && primaryGuestName ? [primaryGuestName] : [];
+  const additional = (event.guestResponses || [])
+    .filter(guest => guest.attending === 'yes')
+    .map(guest => guest.name || `${guest.firstName || ''} ${guest.lastName || ''}`.trim())
+    .filter(Boolean);
+
+  return [...primary, ...additional];
+}
+
 function AdminAccessPrompt({ status, code, error, submitting, onCodeChange, onSubmit }) {
   return (
-    <div className="min-h-screen bg-mauve-50 flex items-center justify-center px-4 py-12">
+    <div className="admin-page min-h-screen flex items-center justify-center px-4 py-12">
       <section className="w-full max-w-sm rounded-lg bg-white border border-mauve-100 shadow-xl p-6 text-center">
         <p className="font-sans text-xs tracking-widest uppercase text-mauve-400 mb-3">
-          Manas &amp; Rupa Sri
+          Manas &amp; Rupa Sree
         </p>
         <h1 className="font-serif text-3xl text-mauve-800 mb-3">
           Admin Access
@@ -93,30 +161,158 @@ function AdminAccessPrompt({ status, code, error, submitting, onCodeChange, onSu
 // ── Edit Modal ────────────────────────────────────────────────────────────────
 function EditModal({ rsvp, onSave, onClose }) {
   const g = rsvp.primaryGuest;
+  const normalizedEvents = normalizeEventAttendance(rsvp);
+  const savedEventsById = new Map(normalizedEvents.map(event => [event.id, event]));
+  const editsFullInvite = rsvp.invitationMode === 'full' || normalizedEvents.length > 1;
+  const editableEvents = editsFullInvite ? FULL_EVENT_DETAILS : normalizedEvents;
+  const originalAdditionals = rsvp.additionalGuests || [];
+  const createInitialEventResponses = () => (
+    Object.fromEntries(editableEvents.map(event => {
+      const savedEvent = savedEventsById.get(event.id);
+      const savedGuestResponses = Array.isArray(savedEvent?.guestResponses) ? savedEvent.guestResponses : [];
+      const fallbackPrimary = event.id === WEDDING_EVENT_ID
+        ? (savedEvent?.attending || g.attending || 'no')
+        : (savedEvent?.attending || 'no');
+
+      return [event.id, {
+        primary: fallbackPrimary,
+        guests: originalAdditionals.map((_, index) => (
+          savedGuestResponses[index]?.attending || (editsFullInvite ? 'no' : fallbackPrimary)
+        )),
+      }];
+    }))
+  );
   const [form, setForm] = useState({
     firstName: g.firstName || '',
     lastName:  g.lastName  || '',
-    attending: g.attending || 'yes',
+    attending: getWeddingAttendance(rsvp) || g.attending || 'yes',
     phone:     g.phone     || '',
     email:     g.email     || '',
     notes:     g.notes     || '',
   });
   const [additionals, setAdditionals] = useState(
-    (rsvp.additionalGuests || []).map(ag => ({ ...ag }))
+    originalAdditionals.map(ag => ({ ...ag }))
   );
+  const [eventResponses, setEventResponses] = useState(createInitialEventResponses);
   const [saving, setSaving] = useState(false);
 
   const updateAdditional = (i, field, val) =>
     setAdditionals(prev => prev.map((a, idx) => idx === i ? { ...a, [field]: val } : a));
 
-  const addGuest    = () => setAdditionals(prev => [...prev, { firstName: '', lastName: '' }]);
-  const removeGuest = (i) => setAdditionals(prev => prev.filter((_, idx) => idx !== i));
+  const addGuest = () => {
+    setAdditionals(prev => [...prev, { firstName: '', lastName: '' }]);
+    setEventResponses(prev => (
+      Object.fromEntries(Object.entries(prev).map(([eventId, response]) => [
+        eventId,
+        { ...response, guests: [...(response.guests || []), 'no'] },
+      ]))
+    ));
+  };
+  const removeGuest = (i) => {
+    setAdditionals(prev => prev.filter((_, idx) => idx !== i));
+    setEventResponses(prev => (
+      Object.fromEntries(Object.entries(prev).map(([eventId, response]) => [
+        eventId,
+        { ...response, guests: (response.guests || []).filter((_, idx) => idx !== i) },
+      ]))
+    ));
+  };
+
+  const updateWeddingAttendance = (value) => {
+    setForm(f => ({ ...f, attending: value }));
+    setEventResponses(prev => ({
+      ...prev,
+      [WEDDING_EVENT_ID]: {
+        ...(prev[WEDDING_EVENT_ID] || { guests: [] }),
+        primary: value,
+      },
+    }));
+  };
+
+  const updateEventResponse = (eventId, guestIndex, value) => {
+    if (guestIndex === -1 && eventId === WEDDING_EVENT_ID) {
+      setForm(f => ({ ...f, attending: value }));
+    }
+
+    setEventResponses(prev => {
+      const current = prev[eventId] || { primary: 'no', guests: additionals.map(() => 'no') };
+
+      if (guestIndex === -1) {
+        return {
+          ...prev,
+          [eventId]: { ...current, primary: value },
+        };
+      }
+
+      const guests = [...(current.guests || [])];
+      guests[guestIndex] = value;
+      return {
+        ...prev,
+        [eventId]: { ...current, guests },
+      };
+    });
+  };
+
+  const guestDisplayName = (guest, index) => (
+    `${guest.firstName || ''} ${guest.lastName || ''}`.trim() || `Guest ${index + 1}`
+  );
 
   const handleSave = async () => {
     setSaving(true);
+    const filteredAdditionalEntries = additionals
+      .map((guest, index) => ({ guest, index }))
+      .filter(({ guest }) => guest.firstName.trim());
+    const filteredAdditionals = filteredAdditionalEntries.map(({ guest }) => ({
+      ...guest,
+      firstName: guest.firstName.trim(),
+      lastName: (guest.lastName || '').trim(),
+    }));
+    const eventAttendance = editableEvents.map(event => {
+      const savedEvent = savedEventsById.get(event.id) || {};
+      const response = eventResponses[event.id]?.primary || 'no';
+      const savedGuestResponses = Array.isArray(savedEvent.guestResponses) ? savedEvent.guestResponses : [];
+      const guestResponses = filteredAdditionalEntries.map(({ guest, index }) => {
+        const existing = savedGuestResponses[index] || {};
+        const firstName = guest.firstName.trim();
+        const lastName = (guest.lastName || '').trim();
+        return {
+          ...existing,
+          firstName,
+          lastName,
+          name: `${firstName} ${lastName}`.trim(),
+          attending: eventResponses[event.id]?.guests?.[index] || 'no',
+        };
+      });
+
+      return {
+        ...savedEvent,
+        id: event.id,
+        name: event.name,
+        dateLabel: event.dateLabel,
+        timeLabel: event.timeLabel,
+        venue: event.venue,
+        attending: response,
+        primaryGuest: {
+          firstName: form.firstName.trim(),
+          lastName: form.lastName.trim(),
+          name: `${form.firstName.trim()} ${form.lastName.trim()}`.trim(),
+          attending: response,
+        },
+        guestResponses,
+        guestCount: (response === 'yes' ? 1 : 0) +
+          guestResponses.filter(guest => guest.attending === 'yes').length,
+      };
+    });
     const updated = {
-      primaryGuest:    { ...g, ...form },
-      additionalGuests: additionals.filter(a => a.firstName.trim()),
+      primaryGuest: {
+        ...g,
+        ...form,
+        firstName: form.firstName.trim(),
+        lastName: form.lastName.trim(),
+        attending: eventResponses[WEDDING_EVENT_ID]?.primary || form.attending,
+      },
+      additionalGuests: filteredAdditionals,
+      eventAttendance,
     };
     await onSave(rsvp._id || rsvp.id, updated);
     setSaving(false);
@@ -124,7 +320,7 @@ function EditModal({ rsvp, onSave, onClose }) {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[90vh] overflow-y-auto">
 
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-mauve-100">
@@ -155,13 +351,13 @@ function EditModal({ rsvp, onSave, onClose }) {
 
           {/* Attending */}
           <div>
-            <label className="form-label mb-3">Attendance</label>
+            <label className="form-label mb-3">Wedding Ceremony Attendance</label>
             <div className="flex gap-3">
               {['yes', 'no'].map(val => (
                 <button
                   key={val}
                   type="button"
-                  onClick={() => setForm(f => ({ ...f, attending: val }))}
+                  onClick={() => updateWeddingAttendance(val)}
                   className={`flex-1 py-2.5 rounded-lg border-2 font-sans text-sm transition-all ${
                     form.attending === val
                       ? val === 'yes'
@@ -228,6 +424,68 @@ function EditModal({ rsvp, onSave, onClose }) {
               </div>
             ))}
           </div>
+
+          {/* Event RSVPs */}
+          <div>
+            <p className="font-sans text-xs tracking-widest uppercase text-mauve-500 mb-3">Event RSVPs</p>
+            <div className="overflow-x-auto rounded-lg border border-mauve-100">
+              <table className="w-full min-w-[720px] text-sm">
+                <thead>
+                  <tr className="bg-mauve-50">
+                    <th className="py-2 px-3 text-left font-sans text-xs tracking-widest uppercase text-mauve-400">
+                      Guest
+                    </th>
+                    {editableEvents.map(event => (
+                      <th
+                        key={event.id}
+                        className="py-2 px-3 text-left font-sans text-xs tracking-widest uppercase text-mauve-400"
+                      >
+                        {event.shortName || event.name}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr className="border-t border-mauve-100">
+                    <td className="py-2 px-3 font-sans text-mauve-700">
+                      {[form.firstName, form.lastName].filter(Boolean).join(' ') || 'Primary guest'}
+                    </td>
+                    {editableEvents.map(event => (
+                      <td key={event.id} className="py-2 px-3">
+                        <select
+                          className="form-input py-1.5 text-xs min-w-[118px]"
+                          value={eventResponses[event.id]?.primary || 'no'}
+                          onChange={e => updateEventResponse(event.id, -1, e.target.value)}
+                        >
+                          <option value="yes">Attending</option>
+                          <option value="no">Not attending</option>
+                        </select>
+                      </td>
+                    ))}
+                  </tr>
+                  {additionals.map((guest, guestIndex) => (
+                    <tr key={guestIndex} className="border-t border-mauve-100">
+                      <td className="py-2 px-3 font-sans text-mauve-700">
+                        {guestDisplayName(guest, guestIndex)}
+                      </td>
+                      {editableEvents.map(event => (
+                        <td key={event.id} className="py-2 px-3">
+                          <select
+                            className="form-input py-1.5 text-xs min-w-[118px]"
+                            value={eventResponses[event.id]?.guests?.[guestIndex] || 'no'}
+                            onChange={e => updateEventResponse(event.id, guestIndex, e.target.value)}
+                          >
+                            <option value="yes">Attending</option>
+                            <option value="no">Not attending</option>
+                          </select>
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
 
         {/* Footer */}
@@ -258,7 +516,9 @@ function GuestRow({ rsvp, onDelete, onEdit }) {
   const [open, setOpen] = useState(false);
   const g = rsvp.primaryGuest;
   const extras = rsvp.additionalGuests || [];
-  const attending = g.attending === 'yes';
+  const eventAttendance = normalizeEventAttendance(rsvp);
+  const attending = getWeddingAttendance(rsvp) === 'yes';
+  const invitationLabel = formatInvitationMode(rsvp.invitationMode);
 
   return (
     <>
@@ -267,7 +527,14 @@ function GuestRow({ rsvp, onDelete, onEdit }) {
         onClick={() => setOpen(!open)}
       >
         <td className="py-3 px-4 font-sans text-sm text-mauve-800 font-medium whitespace-nowrap">
-          {g.firstName} {g.lastName}
+          <span className="inline-flex items-center gap-2">
+            {g.firstName} {g.lastName}
+            {rsvp.localOnly && (
+              <span className="rounded-full bg-yellow-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-yellow-800">
+                Local
+              </span>
+            )}
+          </span>
         </td>
         <td className="py-3 px-4">
           <span className={`inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-full
@@ -278,6 +545,9 @@ function GuestRow({ rsvp, onDelete, onEdit }) {
         </td>
         <td className="py-3 px-4 font-sans text-sm text-mauve-500 hidden md:table-cell">
           {extras.length > 0 ? `+${extras.length} guest${extras.length > 1 ? 's' : ''}` : '—'}
+        </td>
+        <td className="py-3 px-4 font-sans text-xs text-mauve-500 hidden lg:table-cell">
+          {invitationLabel}
         </td>
         <td className="py-3 px-4 font-sans text-xs text-mauve-400 hidden xl:table-cell">
           {new Date(rsvp.submittedAt).toLocaleDateString('en-US', {
@@ -294,7 +564,7 @@ function GuestRow({ rsvp, onDelete, onEdit }) {
       {/* Expanded row */}
       {open && (
         <tr className="bg-mauve-50/60">
-          <td colSpan={5} className="py-4 px-6">
+          <td colSpan={6} className="py-4 px-6">
             <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 text-sm">
               {/* Contact */}
               <div className="space-y-1">
@@ -343,12 +613,35 @@ function GuestRow({ rsvp, onDelete, onEdit }) {
               )}
             </div>
 
+            <div className="admin-event-rsvp-list">
+              <p className="font-sans text-xs tracking-widest uppercase text-mauve-400 mb-3">Event RSVPs</p>
+              <div className="admin-event-grid">
+                {eventAttendance.map(event => {
+                  const guestNames = getEventGuestNames(rsvp, event);
+                  const guestCount = Number(event.guestCount) || guestNames.length;
+
+                  return (
+                    <div key={event.id} className="admin-event-pill">
+                      <span>{event.name}</span>
+                      <strong className={guestCount > 0 ? 'text-sage-700' : 'text-blush-700'}>
+                        {guestCount} attending
+                      </strong>
+                      {guestNames.length > 0 && (
+                        <em>{guestNames.join(', ')}</em>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
             {/* Actions */}
             <div className="mt-4 flex items-center justify-end gap-2">
               <button
                 onClick={(e) => { e.stopPropagation(); onEdit(rsvp); }}
+                disabled={rsvp.localOnly}
                 className="flex items-center gap-1.5 text-xs font-sans text-mauve-600 hover:text-mauve-800
-                           border border-mauve-200 hover:border-mauve-400 rounded px-3 py-1.5 transition-colors"
+                           border border-mauve-200 hover:border-mauve-400 rounded px-3 py-1.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <Pencil className="w-3.5 h-3.5" /> Edit entry
               </button>
@@ -370,16 +663,19 @@ function GuestRow({ rsvp, onDelete, onEdit }) {
 // ── CSV export ────────────────────────────────────────────────────────────────
 function exportCSV(rsvps) {
   const rows = [
-    ['First Name', 'Last Name', 'Attending', 'Email', 'Phone',
-     'Additional Guests', 'Notes', 'Submitted'],
+    ['First Name', 'Last Name', 'Wedding Attendance', 'Invitation Type', 'Event RSVPs',
+     'Email', 'Phone', 'Additional Guests', 'Notes', 'Submitted'],
   ];
   rsvps.forEach(r => {
     const g = r.primaryGuest;
     const extras = (r.additionalGuests || []).map(e => `${e.firstName} ${e.lastName}`).join('; ');
+    const eventSummary = normalizeEventAttendance(r)
+      .map(event => `${event.name}: ${Number(event.guestCount) || 0} attending`)
+      .join('; ');
     rows.push([
-      g.firstName, g.lastName, g.attending === 'yes' ? 'Yes' : 'No',
-      g.email || '', g.phone || '',
-      extras, g.notes || '',
+      g.firstName, g.lastName, getWeddingAttendance(r) === 'yes' ? 'Yes' : 'No',
+      formatInvitationMode(r.invitationMode), eventSummary,
+      g.email || '', g.phone || '', extras, g.notes || '',
       new Date(r.submittedAt).toLocaleDateString(),
     ]);
   });
@@ -404,6 +700,7 @@ export default function Admin() {
   const [rsvps,       setRsvps]       = useState([]);
   const [loading,     setLoading]     = useState(true);
   const [error,       setError]       = useState('');
+  const [rsvpNotice,  setRsvpNotice]  = useState('');
   const [search,      setSearch]      = useState('');
   const [filter,      setFilter]      = useState('all');
   const [sortBy,      setSortBy]      = useState('date_desc');
@@ -411,8 +708,6 @@ export default function Admin() {
   const [analytics,   setAnalytics]   = useState({
     totalPageViews: 0,
     uniqueVisitors: 0,
-    totalVideoPlays: 0,
-    uniqueVideoViewers: 0,
   });
   const [analyticsError, setAnalyticsError] = useState('');
   const [visitors, setVisitors] = useState([]);
@@ -436,8 +731,6 @@ export default function Admin() {
     return {
       totalPageViews: analytics.totalPageViews,
       uniqueVisitors: analytics.uniqueVisitors,
-      totalVideoPlays: analytics.totalVideoPlays,
-      uniqueVideoViewers: analytics.uniqueVideoViewers,
     };
   };
 
@@ -488,12 +781,31 @@ export default function Admin() {
   const fetchRsvps = useCallback(async () => {
     setLoading(true);
     setError('');
+    setRsvpNotice('');
     try {
       const res = await axios.get('/api/guests', AUTHED_REQUEST);
-      setRsvps(res.data.rsvps || []);
-    } catch {
-      const stored = JSON.parse(localStorage.getItem('rsvps') || '[]');
-      setRsvps(stored);
+      const serverRsvps = res.data.rsvps || [];
+      const localRsvps = getLocalRsvps();
+      const mergedRsvps = mergeServerAndLocalRsvps(serverRsvps, localRsvps);
+      const localOnlyCount = mergedRsvps.filter(rsvp => rsvp.localOnly).length;
+
+      setRsvps(mergedRsvps);
+      if (localOnlyCount > 0) {
+        setRsvpNotice(
+          `${localOnlyCount} RSVP ${localOnlyCount === 1 ? 'is' : 'are'} only saved in this browser. ` +
+          'That means the server save failed when it was submitted, so it may not appear on other devices.'
+        );
+      }
+    } catch (err) {
+      const localRsvps = getLocalRsvps();
+      setRsvps(localRsvps);
+      if (localRsvps.length > 0) {
+        setRsvpNotice(
+          'Unable to load server RSVPs. Showing only local backup RSVPs saved in this browser.'
+        );
+      } else {
+        setError(err.response?.data?.error || 'Unable to load RSVPs from the server.');
+      }
     } finally {
       setLoading(false);
     }
@@ -558,6 +870,19 @@ export default function Admin() {
 
   const handleDelete = async (id) => {
     if (!window.confirm('Delete this RSVP entry?')) return;
+    const target = rsvps.find(r => (r._id || r.id) === id);
+
+    if (target?.localOnly) {
+      const remainingLocal = getLocalRsvps().filter(rsvp => rsvp.id !== id);
+      localStorage.setItem('rsvps', JSON.stringify(remainingLocal.map(stripLocalOnlyFlag)));
+      setRsvps(prev => prev.filter(r => (r._id || r.id) !== id));
+      setRsvpNotice(remainingLocal.length > 0
+        ? `${remainingLocal.length} local backup RSVP${remainingLocal.length === 1 ? '' : 's'} remain in this browser.`
+        : ''
+      );
+      return;
+    }
+
     try {
       await axios.delete(`/api/guests?id=${id}`, AUTHED_REQUEST);
       setRsvps(prev => prev.filter(r => (r._id || r.id) !== id));
@@ -583,28 +908,36 @@ export default function Admin() {
 
   // ── Derived stats ──────────────────────────────────────────────────────────
   const totalPrimary   = rsvps.length;
-  const attending      = rsvps.filter(r => r.primaryGuest?.attending === 'yes');
-  const declined       = rsvps.filter(r => r.primaryGuest?.attending === 'no');
-  const totalHeadcount = attending.reduce((acc, r) =>
-    acc + 1 + (r.additionalGuests?.filter(g => g.firstName)?.length || 0), 0);
+  const attending      = rsvps.filter(r => getWeddingAttendance(r) === 'yes');
+  const declined       = rsvps.filter(r => getWeddingAttendance(r) === 'no');
+  const eventStats = FULL_EVENT_DETAILS.map(event => ({
+    ...event,
+    guestCount: rsvps.reduce((acc, rsvp) => acc + getEventGuestCount(rsvp, event.id), 0),
+  }));
 
   // ── Filtering + sorting ────────────────────────────────────────────────────
   const filtered = rsvps
     .filter(r => {
       const g = r.primaryGuest;
       if (!g) return false;
-      if (filter === 'attending') return g.attending === 'yes';
-      if (filter === 'declined')  return g.attending === 'no';
+      if (filter === 'attending') return getWeddingAttendance(r) === 'yes';
+      if (filter === 'declined')  return getWeddingAttendance(r) === 'no';
       return true;
     })
     .filter(r => {
       if (!search) return true;
       const q = search.toLowerCase();
       const g = r.primaryGuest;
+      const eventText = normalizeEventAttendance(r)
+        .map(event => `${event.name} ${getAttendanceText(event.attending)}`)
+        .join(' ')
+        .toLowerCase();
       return (
         `${g.firstName} ${g.lastName}`.toLowerCase().includes(q) ||
         (g.email || '').toLowerCase().includes(q) ||
-        (g.phone || '').includes(q)
+        (g.phone || '').includes(q) ||
+        formatInvitationMode(r.invitationMode).toLowerCase().includes(q) ||
+        eventText.includes(q)
       );
     })
     .sort((a, b) => {
@@ -651,7 +984,7 @@ export default function Admin() {
   }
 
   return (
-    <div className="min-h-screen bg-mauve-50/30 pt-16 md:pt-20">
+    <div className="admin-page min-h-screen">
 
       {/* Edit modal */}
       {editingRsvp && (
@@ -662,14 +995,14 @@ export default function Admin() {
         />
       )}
 
-      <div className="max-w-6xl mx-auto px-4 py-10">
+      <div className="max-w-6xl mx-auto px-4 py-6 md:py-8">
 
         {/* Header */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
           <div>
             <h1 className="font-serif text-3xl md:text-4xl text-mauve-800">Admin Dashboard</h1>
             <p className="font-sans text-sm text-mauve-400 mt-1">
-              Manas &amp; Rupa Sri — Marriage · September 5, 2026
+              Manas &amp; Rupa Sree — Marriage · September 5, 2026
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -789,12 +1122,28 @@ export default function Admin() {
         {/* RSVP Tab Content */}
         {activeTab === 'rsvp' && (
         <div>
+          {rsvpNotice && (
+            <div className="mb-6 rounded-lg border border-yellow-200 bg-yellow-50 px-4 py-3">
+              <p className="font-sans text-sm font-medium text-yellow-800">
+                {rsvpNotice}
+              </p>
+              <p className="font-sans text-xs text-yellow-700 mt-1">
+                Check the Vercel server logs and MongoDB environment variables if this appears after a real guest submits.
+              </p>
+            </div>
+          )}
+
           {/* RSVP Stats */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-            <StatCard label="Total RSVPs"  value={totalPrimary}     color="mauve" />
-            <StatCard label="Attending"    value={attending.length} color="green" sub={`${totalHeadcount} total guests`} />
-            <StatCard label="Declined"     value={declined.length}  color="red"   />
-            <StatCard label="Head Count"   value={totalHeadcount}   color="yellow" sub="primary + additional" />
+          <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4 mb-8">
+            {eventStats.map((event, index) => (
+              <StatCard
+                key={event.id}
+                label={event.shortName}
+                value={event.guestCount}
+                color={event.id === WEDDING_EVENT_ID ? 'green' : index % 2 === 0 ? 'mauve' : 'yellow'}
+                sub="guests attending"
+              />
+            ))}
           </div>
 
           {/* RSVP Table */}
@@ -868,12 +1217,13 @@ export default function Admin() {
             </div>
           ) : (
             <div className="admin-table-wrap">
-              <table className="w-full min-w-[560px]">
+              <table className="w-full min-w-[680px]">
                 <thead>
                   <tr className="bg-mauve-50 border-b border-mauve-100">
                     <th className="py-3 px-4 text-left font-sans text-xs tracking-widest uppercase text-mauve-400">Name</th>
                     <th className="py-3 px-4 text-left font-sans text-xs tracking-widest uppercase text-mauve-400">Status</th>
                     <th className="py-3 px-4 text-left font-sans text-xs tracking-widest uppercase text-mauve-400 hidden md:table-cell">+Guests</th>
+                    <th className="py-3 px-4 text-left font-sans text-xs tracking-widest uppercase text-mauve-400 hidden lg:table-cell">Invite</th>
                     <th className="py-3 px-4 text-left font-sans text-xs tracking-widest uppercase text-mauve-400 hidden xl:table-cell">Submitted</th>
                     <th className="py-3 px-4" />
                   </tr>
@@ -908,11 +1258,9 @@ export default function Admin() {
         {activeTab === 'visitors' && (
         <div>
           {/* Visitor Analytics Stats (filtered) */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-8">
             <StatCard label="Website Visits" value={filteredAnalytics.totalPageViews} color="mauve" />
             <StatCard label="Unique Visitors" value={filteredAnalytics.uniqueVisitors} color="green" />
-            <StatCard label="Video Plays" value={filteredAnalytics.totalVideoPlays} color="yellow" />
-            <StatCard label="Video Viewers (Unique)" value={filteredAnalytics.uniqueVideoViewers} color="red" />
           </div>
 
           {(analyticsError || visitorError) && (
@@ -1008,6 +1356,7 @@ export default function Admin() {
                                   <div className="flex flex-wrap items-center gap-x-5 gap-y-1 mb-3">
                                     <span className="font-medium text-mauve-800">Time spent: {formatDuration(visitor.durationSeconds)}</span>
                                     {visitor.pagePath && <span>Page: {visitor.pagePath}</span>}
+                                    {visitor.metadata?.invitationLabel && <span>Invite: {visitor.metadata.invitationLabel}</span>}
                                   </div>
 
                                   {visitor.actions?.length ? (

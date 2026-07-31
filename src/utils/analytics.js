@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useRef } from 'react';
-import axios from 'axios';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { createQueueId, enqueueAnalyticsEvent, flushAnalyticsOutbox } from './offlineOutbox';
+
+let analyticsFlushTimer = null;
 
 function getOrCreateSessionId() {
   let sessionId = localStorage.getItem('sessionId');
@@ -45,40 +47,90 @@ function sendAnalyticsBeacon(payload) {
   return navigator.sendBeacon('/api/analytics', body);
 }
 
+async function sendAnalyticsPayload(payload) {
+  const response = await fetch('/api/analytics', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Analytics save failed with HTTP ${response.status}`);
+  }
+}
+
+function scheduleAnalyticsFlush() {
+  if (analyticsFlushTimer) return;
+
+  analyticsFlushTimer = window.setTimeout(() => {
+    analyticsFlushTimer = null;
+    flushAnalyticsOutbox().catch(() => {});
+  }, 5000);
+}
+
 export function trackEvent(eventType, details = {}, options = {}) {
   const sessionId = getOrCreateSessionId();
   const deviceInfo = parseDeviceInfo();
   const payload = {
     eventType,
+    clientEventId: details.clientEventId || createQueueId('analytics'),
     sessionId,
     deviceInfo: `${deviceInfo.device} - ${deviceInfo.os} - ${deviceInfo.browser}`,
     pagePath: window.location.pathname,
     ...details,
   };
 
-  if (options.beacon && sendAnalyticsBeacon(payload)) {
-    return;
+  if (options.beacon) {
+    enqueueAnalyticsEvent(payload);
+    if (sendAnalyticsBeacon(payload)) {
+      scheduleAnalyticsFlush();
+      return;
+    }
   }
 
-  axios.post('/api/analytics', payload).catch(() => {});
+  sendAnalyticsPayload(payload)
+    .then(() => {
+      flushAnalyticsOutbox().catch(() => {});
+    })
+    .catch(() => {
+      enqueueAnalyticsEvent(payload);
+      scheduleAnalyticsFlush();
+    });
 }
 
-export function useVisitAnalytics({ sections = [], scrollDepths = [25, 50, 100] } = {}) {
+export function flushQueuedAnalytics() {
+  if (analyticsFlushTimer) {
+    window.clearTimeout(analyticsFlushTimer);
+    analyticsFlushTimer = null;
+  }
+
+  return flushAnalyticsOutbox();
+}
+
+export function useVisitAnalytics({ sections = [], scrollDepths = [25, 50, 100], metadata = null } = {}) {
   const visitIdRef = useRef(createVisitId());
   const visitStartedAtRef = useRef(Date.now());
   const trackedScrollDepthsRef = useRef(new Set());
   const trackedSectionsRef = useRef(new Set());
   const sectionKey = sections.join('|');
   const scrollDepthKey = scrollDepths.join('|');
+  const metadataKey = JSON.stringify(metadata || {});
+  const baseMetadata = useMemo(() => metadata || null, [metadataKey]);
+
+  const mergeMetadata = useCallback((actionMetadata = null) => {
+    if (!baseMetadata) return actionMetadata;
+    if (!actionMetadata) return baseMetadata;
+    return { ...baseMetadata, ...actionMetadata };
+  }, [baseMetadata]);
 
   const trackAction = useCallback((actionName, actionLabel, metadata = null, options = {}) => {
     trackEvent('action', {
       visitId: visitIdRef.current,
       actionName,
       actionLabel,
-      metadata,
+      metadata: mergeMetadata(metadata),
     }, options);
-  }, []);
+  }, [mergeMetadata]);
 
   const handleTrackedClick = useCallback((event) => {
     const target = event.target?.closest?.('a, button, [role="button"]');
@@ -108,7 +160,7 @@ export function useVisitAnalytics({ sections = [], scrollDepths = [25, 50, 100] 
       }, { beacon });
     };
 
-    trackEvent('page_view', { visitId });
+    trackEvent('page_view', { visitId, metadata: baseMetadata });
 
     const durationInterval = setInterval(() => sendDurationUpdate(), 15000);
     const handleVisibilityChange = () => {
@@ -127,7 +179,7 @@ export function useVisitAnalytics({ sections = [], scrollDepths = [25, 50, 100] 
       window.removeEventListener('beforeunload', handleBeforeUnload);
       sendDurationUpdate(true);
     };
-  }, []);
+  }, [baseMetadata]);
 
   useEffect(() => {
     if (!scrollDepthKey) return undefined;

@@ -1,6 +1,6 @@
-# Manas & Rupa Sri Marriage Website
+# Manas & Rupa Sree Marriage Website
 
-RSVP website for Manas and Rupa Sri's marriage celebration, built with React, Vite, Tailwind CSS, Vercel serverless functions, and optional MongoDB persistence.
+RSVP website for Manas and Rupa Sree's marriage celebration, built with React, Vite, Tailwind CSS, Vercel serverless functions, and optional MongoDB persistence.
 
 ## Local Development
 
@@ -15,10 +15,11 @@ The local site runs at `http://localhost:5173`.
 
 | Route | Description |
 | --- | --- |
-| `/` | Home page with names, countdown, invitation video, and event details |
-| `/schedule` | Event schedule, venue details, and calendar links |
-| `/rsvp` | RSVP form for guests and additional attendees |
-| `/admin-mr-2026` | Hidden admin dashboard for RSVPs and visitor logs |
+| `/wedding` | Wedding-only single-page invite with poster, RSVP, countdown, venue details, and calendar links |
+| `/wedding/rsvp` | Wedding-only RSVP form for guests and additional attendees |
+| `/marriage/celebrations` | Full celebration single-page invite with poster, RSVP, countdown, timeline, venue/map links, and calendar links |
+| `/marriage/celebrations/rsvp` | Full celebration RSVP form |
+| `/admin-mr-2026` | Admin dashboard for RSVPs and visitor logs |
 
 The public site is open by default. The admin dashboard asks for the owner access code before showing RSVP data.
 
@@ -34,13 +35,15 @@ The page detects the MP4 automatically and shows the custom video player.
 
 ## Data Storage
 
-RSVPs use `/api/rsvp` and `/api/guests`. If `MONGODB_URI` is not configured, submissions fall back to browser `localStorage`.
+RSVPs use `/api/rsvp` and `/api/guests`. If the MongoDB save fails, submissions are queued in the guest's browser for retry. When Resend email fallback is configured, the server also emails a backup copy of the RSVP to the hardcoded backup recipients in `api/_emailFallback.js`.
 
 Copy `.env.example` to `.env` and set:
 
 ```text
 MONGODB_URI=mongodb+srv://...
 MONGODB_DB=marriage
-OWNER_ACCESS_CODE=manasrupa2026
-SITE_ACCESS_SECRET=change-this-random-secret
+VITE_ADMIN_PATH=/admin-mr-2026
+OWNER_ACCESS_CODE=replace-with-a-private-owner-code
+SITE_ACCESS_SECRET=replace-with-a-long-random-cookie-secret
+RESEND_API_KEY=re_...
 ```

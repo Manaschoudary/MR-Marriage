@@ -1,9 +1,11 @@
-import { useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import axios from 'axios';
-import { FloralSprig, FloralTopBanner } from '../components/FloralDecor';
 import { Check, ChevronRight, Users, Phone, Mail, MessageSquare, Calendar, CalendarPlus } from 'lucide-react';
 import { useVisitAnalytics } from '../utils/analytics';
-import { downloadCalendarInvite, getGoogleCalendarUrl } from '../utils/calendar';
+import { addGoogleCalendarInvite, downloadCalendarInvite, getGoogleCalendarUrl } from '../utils/calendar';
+import { useScrollReveal } from '../utils/scrollReveal';
+import { WEDDING_EVENT_ID, getInvitationConfig } from '../utils/events';
+import { createQueueId, flushLocalRsvps, hasStoredLocalRsvp, saveLocalRsvp } from '../utils/offlineOutbox';
 
 // ── Step indicator ──────────────────────────────────────────────────────────
 function StepDot({ step, current, label }) {
@@ -13,7 +15,7 @@ function StepDot({ step, current, label }) {
     <div className="flex flex-col items-center gap-1.5">
       <div className={`w-8 h-8 rounded-full flex items-center justify-center transition-all duration-300 font-sans text-xs font-bold
         ${done   ? 'bg-mauve-600 text-white' :
-          active ? 'bg-white border-2 border-mauve-600 text-mauve-700' :
+          active ? 'bg-[#fffaf4] border-2 border-mauve-600 text-mauve-700' :
                    'bg-mauve-100 text-mauve-300'}`}>
         {done ? <Check className="w-4 h-4" /> : step}
       </div>
@@ -36,10 +38,10 @@ function AttendOption({ value, label, sub, selected, onClick }) {
     <button
       type="button"
       onClick={() => onClick(value)}
-      className={`flex items-center gap-4 w-full p-4 rounded-xl border-2 transition-all duration-200 text-left
+      className={`choice-card
         ${selected
-          ? 'border-mauve-500 bg-mauve-50 shadow-sm'
-          : 'border-mauve-100 bg-white hover:border-mauve-300 hover:bg-mauve-50/50'}`}
+          ? 'is-selected'
+          : ''}`}
     >
       <div className={`w-5 h-5 rounded-full border-2 flex-shrink-0 flex items-center justify-center transition-colors
         ${selected ? 'border-mauve-600 bg-mauve-600' : 'border-mauve-300'}`}>
@@ -54,12 +56,32 @@ function AttendOption({ value, label, sub, selected, onClick }) {
 }
 
 // ── Main RSVP page ───────────────────────────────────────────────────────────
-const blankGuest = () => ({ firstName: '', lastName: '' });
+const createEventResponseMap = (events = []) => (
+  Object.fromEntries(events.map(event => [event.id, '']))
+);
 
-export default function RSVP() {
+const blankGuest = (events = []) => ({
+  firstName: '',
+  lastName: '',
+  eventResponses: createEventResponseMap(events),
+});
+
+export default function RSVP({ invitationMode = 'full' }) {
+  const invitation = getInvitationConfig(invitationMode);
+  const stepLabels = invitation.showAllEvents
+    ? ['Your Info', 'Events', 'Submit']
+    : ['Your Info', 'Submit'];
+  const submitStep = invitation.showAllEvents ? 3 : 2;
+  const analyticsMetadata = {
+    invitationMode: invitation.mode,
+    invitationLabel: invitation.label,
+    inviteHomePath: invitation.homePath,
+  };
   const { trackAction, handleTrackedClick } = useVisitAnalytics({
     sections: ['RSVP Header', 'RSVP Form'],
+    metadata: analyticsMetadata,
   });
+  useScrollReveal();
   const startedRef = useRef(false);
   const formStartRef = useRef(null);
   const additionalGuestsRef = useRef(null);
@@ -69,11 +91,14 @@ export default function RSVP() {
   const [attending,     setAttending]    = useState('');
   const [additionalNum, setAdditionalNum]= useState(0);
   const [additionals,   setAdditionals]  = useState([]);
+  const [eventResponses, setEventResponses] = useState(() => createEventResponseMap(invitation.additionalEvents));
   const [showGuestConfirm, setShowGuestConfirm] = useState(false);
   const [confirmedSolo, setConfirmedSolo] = useState(false);
   const [contact,       setContact]      = useState({ phone: '', email: '', notes: '' });
   const [submitting,    setSubmitting]   = useState(false);
   const [submitted,     setSubmitted]    = useState(false);
+  const [submissionStorage, setSubmissionStorage] = useState('');
+  const [localSubmissionId, setLocalSubmissionId] = useState('');
   const [error,         setError]        = useState('');
 
   const trackRsvpStarted = () => {
@@ -82,12 +107,32 @@ export default function RSVP() {
     trackAction('rsvp_started', 'Started RSVP form');
   };
 
+  const normalizeGuestEventResponses = (guest = {}) => ({
+    ...guest,
+    eventResponses: {
+      ...createEventResponseMap(invitation.events),
+      ...(guest.eventResponses || {}),
+    },
+  });
+
   const handleAdditionalNumChange = (n) => {
     trackRsvpStarted();
     const num = Math.max(0, Math.min(8, n));
     setConfirmedSolo(false);
     setAdditionalNum(num);
-    setAdditionals(Array.from({ length: num }, (_, i) => additionals[i] || blankGuest()));
+    setAdditionals(prev => (
+      Array.from({ length: num }, (_, i) => normalizeGuestEventResponses(prev[i] || blankGuest(invitation.events)))
+    ));
+  };
+
+  const handleWeddingAttendanceChange = (value) => {
+    trackRsvpStarted();
+    setAttending(value);
+    setConfirmedSolo(false);
+    if (value === 'no' && !invitation.showAllEvents) {
+      setAdditionalNum(0);
+      setAdditionals([]);
+    }
   };
 
   const updateAdditional = (i, field, value) => {
@@ -95,30 +140,117 @@ export default function RSVP() {
     setAdditionals(prev => prev.map((g, idx) => idx === i ? { ...g, [field]: value } : g));
   };
 
+  const getGuestEventResponse = (guest, eventId) => (
+    guest?.eventResponses?.[eventId] || ''
+  );
+
+  const updateGuestEventResponse = (guestIndex, eventId, value) => {
+    trackRsvpStarted();
+    setAdditionals(prev => prev.map((guest, idx) => {
+      if (idx !== guestIndex) return guest;
+      const normalized = normalizeGuestEventResponses(guest);
+      return {
+        ...normalized,
+        eventResponses: {
+          ...normalized.eventResponses,
+          [eventId]: value,
+        },
+      };
+    }));
+  };
+
   const additionalGuestsValid = () => (
     additionalNum === 0 || additionals.every(guest => guest.firstName.trim())
   );
+
+  const additionalGuestSectionActive = () => invitation.showAllEvents || attending === 'yes';
 
   const step1Valid = () => Boolean(
     firstName.trim() &&
     lastName.trim() &&
     attending !== '' &&
-    (attending !== 'yes' || additionalGuestsValid())
+    (!additionalGuestSectionActive() || additionalGuestsValid())
   );
 
-  const completeStepOne = () => {
-    trackAction('rsvp_step_completed', 'Completed RSVP step 1', {
-      attending,
-      additionalGuests: additionalNum,
+  const getEventResponse = (eventId) => (
+    eventId === WEDDING_EVENT_ID ? attending : eventResponses[eventId]
+  );
+
+  const updateEventResponse = (eventId, value) => {
+    trackRsvpStarted();
+    if (eventId === WEDDING_EVENT_ID) {
+      handleWeddingAttendanceChange(value);
+      return;
+    }
+    setEventResponses(prev => ({ ...prev, [eventId]: value }));
+  };
+
+  const eventResponsesValid = () => (
+    !invitation.showAllEvents ||
+    invitation.events.every(event => (
+      ['yes', 'no'].includes(getEventResponse(event.id)) &&
+      confirmedAdditionalGuests().every(guest => ['yes', 'no'].includes(getGuestEventResponse(guest, event.id)))
+    ))
+  );
+
+  const confirmedAdditionalGuests = () => additionals.filter(g => g.firstName.trim());
+
+  const eventAttendancePayload = () => {
+    const additionalGuests = confirmedAdditionalGuests();
+    return invitation.events.map(event => {
+      const response = getEventResponse(event.id);
+      const guestResponses = additionalGuests.map(guest => {
+        const guestResponse = invitation.showAllEvents
+          ? getGuestEventResponse(guest, event.id)
+          : response;
+
+        return {
+          firstName: guest.firstName,
+          lastName: guest.lastName || '',
+          name: `${guest.firstName} ${guest.lastName || ''}`.trim(),
+          attending: guestResponse,
+        };
+      });
+      const guestCount = (response === 'yes' ? 1 : 0) +
+        guestResponses.filter(guest => guest.attending === 'yes').length;
+
+      return {
+        id: event.id,
+        name: event.name,
+        dateLabel: event.dateLabel,
+        timeLabel: event.timeLabel,
+        venue: event.venue,
+        attending: response,
+        primaryGuest: {
+          firstName,
+          lastName,
+          name: `${firstName} ${lastName}`.trim(),
+          attending: response,
+        },
+        guestResponses,
+        guestCount,
+      };
     });
-    setStep(2);
+  };
+
+  const scrollToFormStart = () => {
     requestAnimationFrame(() => {
       formStartRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
   };
 
+  const completeStepOne = () => {
+    trackAction('rsvp_step_completed', 'Completed RSVP step 1', {
+      attending,
+      additionalGuests: additionalNum,
+      invitationMode: invitation.mode,
+    });
+    setStep(invitation.showAllEvents ? 2 : submitStep);
+    scrollToFormStart();
+  };
+
   const handleContinue = () => {
-    if (attending === 'yes' && additionalNum === 0 && !confirmedSolo) {
+    if (!invitation.showAllEvents && attending === 'yes' && additionalNum === 0 && !confirmedSolo) {
       trackAction('rsvp_guest_confirmation_shown', 'Asked to confirm no additional guests');
       setShowGuestConfirm(true);
       return;
@@ -147,32 +279,134 @@ export default function RSVP() {
     });
   };
 
+  const completeEventStep = () => {
+    if (!eventResponsesValid()) return;
+    trackAction('rsvp_step_completed', 'Completed event RSVP step', {
+      invitationMode: invitation.mode,
+      events: eventAttendancePayload().map(event => ({
+        id: event.id,
+        attending: event.attending,
+        guestCount: event.guestCount,
+      })),
+    });
+    setStep(submitStep);
+    scrollToFormStart();
+  };
+
+  useEffect(() => {
+    if (!submitted || !['local', 'email_fallback'].includes(submissionStorage) || !localSubmissionId) return undefined;
+
+    const markSyncedIfNeeded = (syncedRsvps = []) => {
+      const synced = syncedRsvps.some(rsvp => rsvp.clientSubmissionId === localSubmissionId);
+
+      if (synced || !hasStoredLocalRsvp(localSubmissionId)) {
+        setSubmissionStorage('server');
+        setLocalSubmissionId('');
+      }
+    };
+    const trySync = () => {
+      flushLocalRsvps()
+        .then(result => {
+          const emailed = result.emailBackedUp?.some(rsvp => rsvp.clientSubmissionId === localSubmissionId);
+          if (emailed) {
+            setSubmissionStorage('email_fallback');
+          }
+          markSyncedIfNeeded(result.synced || []);
+        })
+        .catch(() => {});
+    };
+
+    trySync();
+    window.addEventListener('online', trySync);
+    const interval = window.setInterval(trySync, 15000);
+
+    return () => {
+      window.removeEventListener('online', trySync);
+      window.clearInterval(interval);
+    };
+  }, [submitted, submissionStorage, localSubmissionId]);
+
   // ── Submit ─────────────────────────────────────────────────────────────────
   const handleSubmit = async () => {
     setSubmitting(true);
     setError('');
+    const additionalGuests = confirmedAdditionalGuests();
+    const eventAttendance = eventAttendancePayload();
     const payload = {
+      invitationMode: invitation.mode,
+      invitationLabel: invitation.label,
+      invitedEvents: invitation.events.map(event => ({
+        id: event.id,
+        name: event.name,
+        dateLabel: event.dateLabel,
+        venue: event.venue,
+      })),
+      eventAttendance,
       primaryGuest: { firstName, lastName, attending, ...contact },
-      additionalGuests: additionals.filter(g => g.firstName.trim()),
+      additionalGuests,
+      clientSubmissionId: createQueueId('rsvp'),
       submittedAt: new Date().toISOString(),
     };
     try {
-      await axios.post('/api/rsvp', payload);
+      const response = await axios.post('/api/rsvp', payload);
+      if (response.data?.storage === 'email_fallback') {
+        const localRsvp = saveLocalRsvp(
+          { ...payload, emailFallbackSent: true },
+          new Error(response.data.warning || 'Database save failed after email backup')
+        );
+        trackAction('rsvp_email_fallback_sent', 'RSVP emailed as database fallback', {
+          attending,
+          invitationMode: invitation.mode,
+          additionalGuests: additionalGuests.length,
+        });
+        trackAction('rsvp_submitted', 'Submitted RSVP', {
+          attending,
+          invitationMode: invitation.mode,
+          additionalGuests: additionalGuests.length,
+          events: eventAttendance.map(event => ({
+            id: event.id,
+            attending: event.attending,
+            guestCount: event.guestCount,
+          })),
+          storage: 'email_fallback',
+        });
+        setSubmissionStorage('email_fallback');
+        setLocalSubmissionId(localRsvp.clientSubmissionId);
+        setSubmitted(true);
+        return;
+      }
       trackAction('rsvp_submitted', 'Submitted RSVP', {
         attending,
-        additionalGuests: additionals.filter(g => g.firstName.trim()).length,
+        invitationMode: invitation.mode,
+        additionalGuests: additionalGuests.length,
+        events: eventAttendance.map(event => ({
+          id: event.id,
+          attending: event.attending,
+          guestCount: event.guestCount,
+        })),
       });
+      setSubmissionStorage('server');
       setSubmitted(true);
-    } catch {
-      // localStorage fallback
-      const stored = JSON.parse(localStorage.getItem('rsvps') || '[]');
-      stored.push({ ...payload, id: Date.now() });
-      localStorage.setItem('rsvps', JSON.stringify(stored));
+    } catch (err) {
+      const localRsvp = saveLocalRsvp(payload, err);
+      trackAction('rsvp_saved_local', 'RSVP saved locally after server save failed', {
+        attending,
+        invitationMode: invitation.mode,
+        error: localRsvp.serverError,
+      });
       trackAction('rsvp_submitted', 'Submitted RSVP', {
         attending,
-        additionalGuests: additionals.filter(g => g.firstName.trim()).length,
+        invitationMode: invitation.mode,
+        additionalGuests: additionalGuests.length,
+        events: eventAttendance.map(event => ({
+          id: event.id,
+          attending: event.attending,
+          guestCount: event.guestCount,
+        })),
         storage: 'local',
       });
+      setSubmissionStorage('local');
+      setLocalSubmissionId(localRsvp.clientSubmissionId);
       setSubmitted(true);
     } finally {
       setSubmitting(false);
@@ -180,58 +414,120 @@ export default function RSVP() {
   };
 
   // ── Success ────────────────────────────────────────────────────────────────
+  const attendanceSummary = eventAttendancePayload();
+  const attendingCalendarEvents = invitation.events.filter(event => (
+    attendanceSummary.some(response => response.id === event.id && response.guestCount > 0)
+  ));
+  const hasAnyAttendance = attendingCalendarEvents.length > 0;
+  const pageClassName = `city2-page rsvp-page ${invitation.showAllEvents ? 'full-invite-page' : ''} min-h-screen bg-[#fffaf4]`;
+  const trackCalendarAction = (provider, events, scope = 'attending_events') => {
+    const eventList = Array.isArray(events) ? events : [events].filter(Boolean);
+    trackAction('calendar_invite_added', `${provider} calendar invite`, {
+      provider,
+      scope,
+      eventCount: eventList.length,
+      eventIds: eventList.map(event => event.id),
+      invitationMode: invitation.mode,
+      source: 'rsvp_success',
+    });
+  };
+
   if (submitted) {
     return (
-      <div className="min-h-screen bg-white pt-16 md:pt-20" onClickCapture={handleTrackedClick}>
-        <div className="max-w-lg mx-auto px-4 py-20 text-center">
+      <div className={`${pageClassName} pt-24 md:pt-28`} onClickCapture={handleTrackedClick}>
+        <div className="max-w-lg mx-auto px-4 py-16 text-center" data-reveal="scale-up">
+          <div className="invite-card">
           <div className="w-20 h-20 rounded-full bg-mauve-100 flex items-center justify-center mx-auto mb-6">
             <Check className="w-10 h-10 text-mauve-600" />
           </div>
           <h1 className="font-serif text-4xl text-mauve-800 mb-3">
-            {attending === 'yes' ? 'See you there!' : 'Thank you!'}
+            {hasAnyAttendance ? 'RSVP received!' : 'Thank you!'}
           </h1>
-          <FloralSprig className="my-4" />
           <p className="font-sans text-mauve-600 text-base mb-2">
-            {attending === 'yes'
-              ? `We're so excited to celebrate with you, ${firstName}!`
+            {hasAnyAttendance
+              ? `Thank you, ${firstName}. We have your event responses.`
               : `Thank you for letting us know, ${firstName}. You'll be missed!`}
           </p>
-          {attending === 'yes' && (
+          {hasAnyAttendance && (
             <>
               <p className="font-sans text-sm text-mauve-400 mb-8">
-                September 5, 2026 · 8:00 AM · Atithi Venue, Plano TX
+                {invitation.showAllEvents
+                  ? `${attendingCalendarEvents.length} event${attendingCalendarEvents.length === 1 ? '' : 's'} marked attending.`
+                  : 'September 5, 2026 · 7:00 PM · Atithi Venue, Plano TX'}
               </p>
               <div className="flex flex-col sm:flex-row gap-3 justify-center">
-                <a
-                  href={getGoogleCalendarUrl()}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center justify-center gap-2 btn-primary text-sm px-6 py-3"
-                >
-                  <CalendarPlus className="w-4 h-4" />
-                  Google Calendar
-                </a>
-                <button
-                  type="button"
-                  onClick={downloadCalendarInvite}
-                  className="flex items-center justify-center gap-2 btn-secondary text-sm px-6 py-3"
-                >
-                  <Calendar className="w-4 h-4" />
-                  Apple / Outlook
-                </button>
+                {invitation.showAllEvents ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        trackCalendarAction('google', attendingCalendarEvents);
+                        addGoogleCalendarInvite(attendingCalendarEvents, {
+                          filename: 'manas-rupa-sree-my-rsvp-events-google.ics',
+                          calendarName: 'Manas & Rupa Sree - My RSVP Events',
+                        });
+                      }}
+                      className="flex items-center justify-center gap-2 btn-primary text-sm px-6 py-3"
+                    >
+                      <CalendarPlus className="w-4 h-4" />
+                      Google Calendar
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        trackCalendarAction('apple_outlook', attendingCalendarEvents);
+                        downloadCalendarInvite(attendingCalendarEvents, {
+                          filename: 'manas-rupa-sree-my-rsvp-events.ics',
+                          calendarName: 'Manas & Rupa Sree - My RSVP Events',
+                        });
+                      }}
+                      className="flex items-center justify-center gap-2 btn-calendar-download text-sm px-6 py-3"
+                    >
+                      <Calendar className="w-4 h-4" />
+                      Apple / Outlook
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <a
+                      href={getGoogleCalendarUrl()}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center justify-center gap-2 btn-primary text-sm px-6 py-3"
+                      onClick={() => trackCalendarAction('google', [invitation.events[0]], 'wedding_event')}
+                    >
+                      <CalendarPlus className="w-4 h-4" />
+                      Google Calendar
+                    </a>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        trackCalendarAction('apple_outlook', [invitation.events[0]], 'wedding_event');
+                        downloadCalendarInvite();
+                      }}
+                      className="flex items-center justify-center gap-2 btn-calendar-download text-sm px-6 py-3"
+                    >
+                      <Calendar className="w-4 h-4" />
+                      Apple / Outlook
+                    </button>
+                  </>
+                )}
               </div>
               <p className="font-sans text-xs text-mauve-400 mt-4">
-                Apple Calendar, Outlook, and most calendar apps accept the .ics format.
+                {invitation.showAllEvents
+                  ? 'These calendar options include only the events marked attending.'
+                  : 'Apple Calendar, Outlook, and most calendar apps accept the .ics format.'}
               </p>
             </>
           )}
+          </div>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-white" onClickCapture={handleTrackedClick}>
+    <div className={pageClassName} onClickCapture={handleTrackedClick}>
       {showGuestConfirm && (
         <div
           className="fixed inset-0 z-[60] flex items-center justify-center bg-black/55 p-4"
@@ -240,7 +536,7 @@ export default function RSVP() {
           aria-labelledby="guest-confirm-title"
           aria-describedby="guest-confirm-description"
         >
-          <div className="w-full max-w-sm bg-white rounded-lg shadow-2xl p-6 text-center">
+          <div className="w-full max-w-sm invite-card text-center">
             <div className="w-14 h-14 rounded-full bg-mauve-100 flex items-center justify-center mx-auto mb-4">
               <Users className="w-7 h-7 text-mauve-700" />
             </div>
@@ -254,7 +550,7 @@ export default function RSVP() {
               <button
                 type="button"
                 onClick={addGuestFromConfirmation}
-                className="w-full flex items-center justify-center gap-2 border border-gray-300 bg-gray-100 text-gray-800 px-6 py-3 font-sans text-sm hover:bg-gray-200 transition-colors"
+                className="w-full btn-primary text-sm px-6 py-3"
                 autoFocus
               >
                 <Users className="w-4 h-4" />
@@ -263,7 +559,7 @@ export default function RSVP() {
               <button
                 type="button"
                 onClick={confirmSoloAttendance}
-                className="w-full flex items-center justify-center border border-gray-300 bg-gray-100 text-gray-800 px-6 py-3 font-sans text-sm hover:bg-gray-200 transition-colors"
+                className="w-full btn-secondary text-sm px-6 py-3"
               >
                 Continue Without Guests
               </button>
@@ -272,34 +568,47 @@ export default function RSVP() {
         </div>
       )}
 
-      {/* Top floral */}
-      <div data-analytics-section="RSVP Header" className="pt-16 md:pt-20 relative overflow-hidden">
-        <FloralTopBanner className="absolute top-0 left-0 right-0 opacity-50" />
-        <div className="relative z-10 py-14 px-4 text-center">
-          <p className="font-sans text-xs tracking-widest3 uppercase text-mauve-400 mb-3">
-            Marriage Ceremony · September 5, 2026
+      <section data-analytics-section="RSVP Header" className="inv-subpage-hero">
+        <div className="inv-subpage-hero__content" data-reveal="fade-up">
+          <p className="invite-kicker rsvp-hero-kicker">
+            {invitation.showAllEvents ? 'Wedding Celebrations' : 'Marriage Ceremony'} · September 5, 2026
           </p>
-          <h1 className="font-serif text-5xl md:text-6xl tracking-widest2 text-mauve-800 uppercase mb-2">
-            RSVP
-          </h1>
+          <h1>RSVP</h1>
+          <p>
+            {invitation.showAllEvents
+              ? 'Let us know which events you can attend, and add any family members joining you.'
+              : 'Let us know if you can celebrate with us, and add any family members joining you.'}
+          </p>
         </div>
-      </div>
+      </section>
 
-      {/* Step indicator — 2 steps now */}
-      <div ref={formStartRef} className="max-w-xs mx-auto px-6 mb-8">
+      {/* Step indicator */}
+      <div
+        ref={formStartRef}
+        className={`${stepLabels.length === 3 ? 'max-w-md' : 'max-w-xs'} mx-auto px-6 mb-8 relative z-10`}
+        data-reveal="fade-up"
+        style={{ '--reveal-delay': '80ms' }}
+      >
         <div className="flex items-center">
-          <StepDot step={1} current={step} label="Your Info" />
-          <StepLine done={step > 1} />
-          <StepDot step={2} current={step} label="Submit"   />
+          {stepLabels.map((label, index) => {
+            const stepNumber = index + 1;
+            return (
+              <Fragment key={label}>
+                <StepDot step={stepNumber} current={step} label={label} />
+                {index < stepLabels.length - 1 && <StepLine done={step > stepNumber} />}
+              </Fragment>
+            );
+          })}
         </div>
       </div>
 
       {/* ── STEP 1: Name + attendance + additional guests ─────────────────── */}
       {step === 1 && (
-        <div data-analytics-section="RSVP Form" className="max-w-lg mx-auto px-4 pb-20 animate-fade-in-up">
-          <div className="card">
-            <h2 className="font-serif text-2xl text-mauve-800 mb-1 text-center">Your Details</h2>
-            <p className="font-sans text-sm text-mauve-400 text-center mb-6">
+        <div data-analytics-section="RSVP Form" className="max-w-lg mx-auto px-4 pb-20 animate-fade-in-up" data-reveal="scale-up" style={{ '--reveal-delay': '140ms' }}>
+          <div className="invite-card rsvp-card">
+            <p className="invite-kicker text-center">Step one</p>
+            <h2 className="font-serif text-3xl text-mauve-800 mb-2 text-center">Your Details</h2>
+            <p className="font-sans text-sm text-mauve-500 text-center mb-6">
               Please enter your first and last name below.
             </p>
 
@@ -327,38 +636,35 @@ export default function RSVP() {
             </div>
 
             <div className="mb-6">
-              <label className="form-label mb-3">Will you attend? *</label>
+              <label className="form-label attendance-label mb-3">
+                <span>Will you attend the wedding </span>
+                <span className="attendance-label__tail">
+                  ceremony?<span className="required-marker" aria-hidden="true">*</span>
+                </span>
+              </label>
               <div className="space-y-3">
                 <AttendOption
                   value="yes"
                   label="Joyfully accepts"
-                  sub="I'll be there to celebrate!"
+                  sub="I'll be there for the marriage ceremony."
                   selected={attending === 'yes'}
-                  onClick={(value) => {
-                    trackRsvpStarted();
-                    setAttending(value);
-                    setConfirmedSolo(false);
-                  }}
+                  onClick={handleWeddingAttendanceChange}
                 />
                 <AttendOption
                   value="no"
                   label="Regretfully declines"
-                  sub="I'm unable to make it"
+                  sub="I'm unable to make the marriage ceremony."
                   selected={attending === 'no'}
-                  onClick={(value) => {
-                    trackRsvpStarted();
-                    setAttending(value);
-                    setConfirmedSolo(false);
-                  }}
+                  onClick={handleWeddingAttendanceChange}
                 />
               </div>
             </div>
 
-            {/* Additional guests — only if attending */}
-            {attending === 'yes' && (
+            {/* Additional guests */}
+            {additionalGuestSectionActive() && (
               <div
                 ref={additionalGuestsRef}
-                className="mb-6 rounded-lg border-2 border-mauve-300 bg-white p-4 shadow-sm"
+                className="mb-6 rounded-lg border border-mauve-200 bg-[#fffaf4] p-4 shadow-sm"
               >
                 <div className="flex items-start gap-3 mb-4">
                   <div className="w-10 h-10 rounded-full bg-mauve-100 flex items-center justify-center flex-shrink-0">
@@ -366,10 +672,14 @@ export default function RSVP() {
                   </div>
                   <div className="text-left">
                     <p className="font-sans text-sm font-semibold text-mauve-800">
-                      Is anyone accompanying you?
+                      {invitation.showAllEvents
+                        ? 'Are any guests included in this invitation?'
+                        : 'Is anyone accompanying you?'}
                     </p>
                     <p className="font-sans text-xs text-mauve-500 mt-1">
-                      Add your spouse, children, family members, or other accompanying guests.
+                      {invitation.showAllEvents
+                        ? 'Add each guest here. On the next step, choose which events each person can attend.'
+                        : 'Add your spouse, children, family members, or other accompanying guests.'}
                     </p>
                   </div>
                 </div>
@@ -377,14 +687,14 @@ export default function RSVP() {
                   <button
                     type="button"
                     onClick={() => handleAdditionalNumChange(additionalNum - 1)}
-                    className="w-10 h-10 rounded-full border-2 border-mauve-200 text-mauve-600 text-xl
+                    className="w-10 h-10 rounded-full border border-mauve-200 text-mauve-600 text-xl
                                flex items-center justify-center hover:border-mauve-400 transition-colors"
                   >−</button>
                   <span className="font-serif text-3xl text-mauve-700 w-8 text-center">{additionalNum}</span>
                   <button
                     type="button"
                     onClick={() => handleAdditionalNumChange(additionalNum + 1)}
-                    className="w-10 h-10 rounded-full border-2 border-mauve-200 text-mauve-600 text-xl
+                    className="w-10 h-10 rounded-full border border-mauve-200 text-mauve-600 text-xl
                                flex items-center justify-center hover:border-mauve-400 transition-colors"
                   >+</button>
                 </div>
@@ -451,11 +761,117 @@ export default function RSVP() {
         </div>
       )}
 
-      {/* ── STEP 2: Contact + confirm ─────────────────────────────────────── */}
-      {step === 2 && (
-        <div data-analytics-section="RSVP Form" className="max-w-lg mx-auto px-4 pb-20 animate-fade-in-up">
-          <div className="card">
-            <h2 className="font-serif text-2xl text-mauve-800 mb-1 text-center">Final Step: Submit RSVP</h2>
+      {/* ── STEP 2: Event-by-event RSVP for full invitations ──────────────── */}
+      {invitation.showAllEvents && step === 2 && (
+        <div data-analytics-section="RSVP Form" className="max-w-2xl mx-auto px-4 pb-20 animate-fade-in-up" data-reveal="scale-up">
+          <div className="invite-card rsvp-card">
+            <p className="invite-kicker text-center">Step two</p>
+            <h2 className="font-serif text-3xl text-mauve-800 mb-2 text-center">Event RSVP</h2>
+            <p className="font-sans text-sm text-mauve-500 text-center mb-6">
+              Please respond for each invited event individually.
+            </p>
+
+            <div className="event-rsvp-list">
+              {invitation.events.map((event) => {
+                const response = getEventResponse(event.id);
+                const guestRows = confirmedAdditionalGuests();
+
+                return (
+                  <article key={event.id} className="event-rsvp-card">
+                    <div className="event-rsvp-card__details">
+                      <p className="invite-kicker">{event.category}</p>
+                      <h3>{event.name}</h3>
+                      <p>{event.dateLabel}</p>
+                      <p>{event.timeLabel} · {event.venue}</p>
+                    </div>
+                    <div className="event-rsvp-attendee-list" aria-label={`${event.name} RSVP`}>
+                      <div className="event-rsvp-attendee-row">
+                        <div>
+                          <span>Primary guest</span>
+                          <strong>{firstName} {lastName}</strong>
+                        </div>
+                        <div className="event-rsvp-card__choices">
+                          {[
+                            { value: 'yes', label: 'Attending' },
+                            { value: 'no', label: 'Not attending' },
+                          ].map(option => (
+                            <button
+                              key={option.value}
+                              type="button"
+                              onClick={() => updateEventResponse(event.id, option.value)}
+                              className={`event-rsvp-choice ${response === option.value ? 'is-selected' : ''}`}
+                              aria-pressed={response === option.value}
+                            >
+                              {option.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {guestRows.map((guest, guestIndex) => {
+                        const guestResponse = getGuestEventResponse(guest, event.id);
+
+                        return (
+                          <div key={`${event.id}-${guestIndex}`} className="event-rsvp-attendee-row">
+                            <div>
+                              <span>Guest {guestIndex + 1}</span>
+                              <strong>{guest.firstName} {guest.lastName}</strong>
+                            </div>
+                            <div className="event-rsvp-card__choices">
+                              {[
+                                { value: 'yes', label: 'Attending' },
+                                { value: 'no', label: 'Not attending' },
+                              ].map(option => (
+                                <button
+                                  key={option.value}
+                                  type="button"
+                                  onClick={() => updateGuestEventResponse(guestIndex, event.id, option.value)}
+                                  className={`event-rsvp-choice ${guestResponse === option.value ? 'is-selected' : ''}`}
+                                  aria-pressed={guestResponse === option.value}
+                                >
+                                  {option.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+
+            {!eventResponsesValid() && (
+              <p className="font-sans text-xs text-blush-600 mt-4 text-center">
+                Please choose attending or not attending for each event.
+              </p>
+            )}
+
+            <div className="flex flex-col gap-3 sm:flex-row-reverse mt-6">
+              <button
+                type="button"
+                onClick={completeEventStep}
+                disabled={!eventResponsesValid()}
+                className={`btn-primary flex-1 flex items-center justify-center gap-2 text-sm py-4
+                  ${!eventResponsesValid() ? 'opacity-40 cursor-not-allowed' : ''}`}
+              >
+                Continue <ChevronRight className="w-4 h-4" />
+              </button>
+              <button type="button" onClick={() => setStep(1)} className="btn-secondary flex-1 text-sm">
+                Back
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Final step: Contact + confirm ─────────────────────────────────── */}
+      {step === submitStep && (
+        <div data-analytics-section="RSVP Form" className="max-w-lg mx-auto px-4 pb-20 animate-fade-in-up" data-reveal="scale-up">
+          <div className="invite-card rsvp-card">
+            <p className="invite-kicker text-center">{invitation.showAllEvents ? 'Step three' : 'Step two'}</p>
+            <h2 className="font-serif text-3xl text-mauve-800 mb-2 text-center">Submit RSVP</h2>
 
             <div className="rounded-lg border border-mauve-800 bg-mauve-800 p-3 mb-6 text-center shadow-sm">
               <p className="font-sans text-sm font-bold text-white">
@@ -506,23 +922,35 @@ export default function RSVP() {
             </div>
 
             {/* Summary */}
-            <div className="bg-mauve-100/60 rounded-xl p-4 mb-6 space-y-2">
+            <div className="bg-[#fffaf4] border border-mauve-100 rounded-lg p-4 mb-6 space-y-2">
               <h3 className="font-serif text-base text-mauve-700 mb-2">Your RSVP Summary</h3>
               <p className="font-sans text-sm text-mauve-600">
                 <span className="font-semibold">{firstName} {lastName}</span>
                 {' — '}
                 <span className={attending === 'yes' ? 'text-sage-600' : 'text-blush-600'}>
-                  {attending === 'yes' ? '✓ Attending' : '✗ Not attending'}
+                  {attending === 'yes' ? '✓ Wedding attending' : '✗ Wedding not attending'}
                 </span>
               </p>
-              {additionals.filter(g => g.firstName).map((g, i) => (
+              {confirmedAdditionalGuests().map((g, i) => (
                 <p key={i} className="font-sans text-sm text-mauve-600">
                   + <span className="font-semibold">{g.firstName} {g.lastName}</span>
                 </p>
               ))}
               <p className="font-sans text-xs text-mauve-400 pt-1 border-t border-mauve-200">
-                {1 + additionals.filter(g => g.firstName).length} guest(s) total
+                {1 + confirmedAdditionalGuests().length} guest(s) total
               </p>
+              {invitation.showAllEvents && (
+                <div className="rsvp-event-summary">
+                  {eventAttendancePayload().map(event => (
+                    <div key={event.id}>
+                      <span>{event.name}</span>
+                      <strong className={event.guestCount > 0 ? 'text-sage-600' : 'text-blush-600'}>
+                        {event.guestCount} attending
+                      </strong>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {error && (
@@ -548,7 +976,7 @@ export default function RSVP() {
                   <>Submit RSVP <Check className="w-4 h-4" /></>
                 )}
               </button>
-              <button onClick={() => setStep(1)} className="btn-secondary flex-1 text-sm">
+              <button onClick={() => setStep(invitation.showAllEvents ? 2 : 1)} className="btn-secondary flex-1 text-sm">
                 Back
               </button>
             </div>
@@ -557,10 +985,9 @@ export default function RSVP() {
       )}
 
       {/* Footer */}
-      <footer className="py-10 text-center border-t border-mauve-100">
-        <FloralSprig className="mb-3" />
+      <footer className="invite-footer">
         <p className="font-serif italic text-mauve-400 text-sm">
-          Manas &amp; Rupa Sri &nbsp;·&nbsp; September 5, 2026
+          Manas &amp; Rupa Sree &nbsp;·&nbsp; September 5, 2026
         </p>
       </footer>
     </div>

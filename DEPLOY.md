@@ -1,4 +1,4 @@
-# Manas & Rupa Sri — Marriage Website
+# Manas & Rupa Sree — Marriage Website
 
 ## Quick Start (local)
 
@@ -30,13 +30,13 @@ Supported format: **MP4** (H.264, any resolution — recommended 1080p or 720p).
 The admin page lives at a hidden URL to keep it private:
 
 ```
-https://your-site.vercel.app/admin-mr-2026
+https://your-site.vercel.app/owner-rsvp-mr-2026
 ```
 
 It asks for the owner access code before showing RSVP data or visit logs.
 
-> **Before going live**, change the slug in `src/App.jsx` line with `/admin-mr-2026` to
-> something only you know, e.g. `/admin-secret-xyz`.
+> **Before going live**, set `VITE_ADMIN_PATH` to a private path only you know.
+> The hidden URL is only a convenience layer; the owner code still protects the dashboard.
 
 ---
 
@@ -68,11 +68,14 @@ In your Vercel project → **Settings → Environment Variables**, add:
 |----------------|-----------------------------------------------------|
 | `MONGODB_URI`  | `mongodb+srv://user:pass@cluster.mongodb.net/`      |
 | `MONGODB_DB`   | `marriage`                                        |
-| `OWNER_ACCESS_CODE` | `manasrupa2026`                              |
+| `VITE_ADMIN_PATH` | `/owner-rsvp-mr-2026` or your private admin path |
+| `OWNER_ACCESS_CODE` | A private owner access code                  |
 | `SITE_ACCESS_SECRET` | A long random secret for admin cookies      |
+| `RESEND_API_KEY` | Optional: Resend API key for RSVP email fallback |
 
-> If you skip this, RSVPs fall back to localStorage on each visitor's own browser
-> (no cross-device persistence). Add MongoDB whenever you're ready.
+> If MongoDB is unavailable, RSVPs queue in the visitor's browser for retry.
+> If `RESEND_API_KEY` is configured, failed database saves are also emailed
+> to the hardcoded backup recipients in `api/_emailFallback.js`.
 
 ### 4. Set up MongoDB Atlas (free tier)
 
@@ -94,8 +97,7 @@ mr-marriage/
 │   │   ├── FloralDecor.jsx   # SVG floral decorations
 │   │   └── Navbar.jsx
 │   ├── pages/
-│   │   ├── Home.jsx          # Hero, countdown, video, event details
-│   │   ├── Schedule.jsx      # Timeline + calendar invite
+│   │   ├── Home.jsx          # Invite home, countdown, venue/timeline, calendar
 │   │   ├── RSVP.jsx          # 2-step RSVP form
 │   │   └── Admin.jsx         # Admin dashboard (hidden URL)
 │   ├── App.jsx               # Router + layout
@@ -114,7 +116,8 @@ mr-marriage/
 
 | Route               | Description                          |
 |---------------------|--------------------------------------|
-| `/`                 | Home — names, countdown, video, CTA  |
-| `/schedule`         | Event timeline + calendar invite     |
-| `/rsvp`             | 2-step RSVP form (open to anyone)    |
-| `/admin-mr-2026`    | Admin dashboard (change slug!)       |
+| `/wedding`          | Wedding-only single-page invite |
+| `/wedding/rsvp`     | Wedding-only RSVP form |
+| `/marriage/celebrations` | Full celebration single-page invite |
+| `/marriage/celebrations/rsvp` | Full celebration RSVP form |
+| `/owner-rsvp-mr-2026` | Admin dashboard; override with `VITE_ADMIN_PATH` |
