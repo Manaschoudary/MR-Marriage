@@ -44,3 +44,4 @@ MONGODB_DB=marriage
 OWNER_ACCESS_CODE=manasrupa2026
 SITE_ACCESS_SECRET=change-this-random-secret
 ```
+
